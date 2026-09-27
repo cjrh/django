@@ -1,4 +1,7 @@
+import os
+import threading
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ContextDecorator, contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -10,6 +13,7 @@ from django.db import (
     DatabaseError,
     Error,
     ProgrammingError,
+    close_old_connections,
     connections,
 )
 from django.utils.deprecation import RemovedInDjango2028Warning
@@ -155,9 +159,60 @@ def on_commit(func, using=None, robust=False):
 #################################
 
 # Async atomic blocks entered in the current context, innermost last. Each item
-# is the ThreadSensitiveContext that owns the block's worker thread, or None
+# is a (ThreadSensitiveContext, worker) pair for an outermost block, or None
 # for a nested block that reuses the worker of an enclosing block.
 _async_atomic_blocks = ContextVar("async_atomic_blocks", default=())
+
+
+class _TransactionWorkers:
+    """
+    Single-thread executors for outermost async atomic blocks.
+
+    A worker runs one transaction at a time. Between transactions, an idle
+    worker keeps its database connections, subject to CONN_MAX_AGE, like the
+    thread that handles sync requests.
+    """
+
+    max_idle = 8
+
+    def __init__(self):
+        self._reset()
+        if hasattr(os, "register_at_fork"):
+            # Worker threads don't exist in a forked child process.
+            os.register_at_fork(after_in_child=self._reset)
+
+    def _reset(self):
+        self._lock = threading.Lock()
+        self._idle = []
+
+    def acquire(self):
+        with self._lock:
+            if self._idle:
+                return self._idle.pop()
+        return ThreadPoolExecutor(max_workers=1, thread_name_prefix="django-atomic")
+
+    def release(self, worker):
+        with self._lock:
+            if len(self._idle) < self.max_idle:
+                self._idle.append(worker)
+                return
+        self.discard(worker)
+
+    def clear(self):
+        """Stop the idle workers and close their connections."""
+        with self._lock:
+            idle, self._idle = self._idle, []
+        for worker in idle:
+            self.discard(worker, wait=True)
+
+    @staticmethod
+    def discard(worker, wait=False):
+        # Close the connections of the worker on its thread, then stop it.
+        worker.submit(connections.close_all)
+        worker.shutdown(wait=wait)
+
+
+_transaction_workers = _TransactionWorkers()
 
 
 class Atomic(ContextDecorator):
@@ -340,42 +395,58 @@ class Atomic(ContextDecorator):
             # connection. __enter__() creates a savepoint. This also applies
             # when a sync atomic block is open on the thread that called
             # async_to_sync(), for example the atomic block of a TestCase.
-            thread_context = None
+            outermost = None
+            enter = self.__enter__
         else:
-            # Outermost block: connections are stored per thread, so a new
-            # worker thread gives this transaction its own connection. Other
-            # tasks can't run queries in this transaction while it's open.
-            thread_context = ThreadSensitiveContext(force_new_thread=True)
-            await thread_context.__aenter__()
+            # Outermost block: connections are stored per thread, so a worker
+            # thread that only this transaction uses gives it its own
+            # connection. Other tasks can't run queries in this transaction
+            # while it's open.
+            worker = _transaction_workers.acquire()
+            outermost = (ThreadSensitiveContext(executor=worker), worker)
+            await outermost[0].__aenter__()
+            enter = self._enter_outermost
         try:
-            await sync_to_async(self.__enter__)()
+            await sync_to_async(enter)()
         except BaseException:
-            if thread_context is not None:
-                await self._aexit_thread_context(thread_context)
+            if outermost is not None:
+                await self._aexit_outermost(*outermost)
             raise
-        _async_atomic_blocks.set((*blocks, thread_context))
+        _async_atomic_blocks.set((*blocks, outermost))
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
-        *blocks, thread_context = _async_atomic_blocks.get()
+        *blocks, outermost = _async_atomic_blocks.get()
         _async_atomic_blocks.set(tuple(blocks))
         try:
             await sync_to_async(self.__exit__)(exc_type, exc_value, traceback)
         finally:
-            if thread_context is not None:
-                await self._aexit_thread_context(thread_context)
+            if outermost is not None:
+                await self._aexit_outermost(*outermost)
 
     def _in_atomic_block(self):
         return get_connection(self.using).in_atomic_block
 
+    def _enter_outermost(self):
+        # The worker can be idle for a long time, as between requests. Close
+        # connections that are broken or too old before they are used.
+        close_old_connections()
+        self.__enter__()
+
     @staticmethod
-    async def _aexit_thread_context(thread_context):
+    async def _aexit_outermost(thread_context, worker):
+        reusable = False
         try:
-            # The worker thread stops when its context exits. Close the
-            # connections that it opened. This must run on the worker thread.
-            await sync_to_async(connections.close_all)()
+            # Close connections that are broken or too old, as at the end of a
+            # request. This must run on the worker thread.
+            await sync_to_async(close_old_connections)()
+            reusable = True
         finally:
             await thread_context.__aexit__(None, None, None)
+            if reusable:
+                _transaction_workers.release(worker)
+            else:
+                _transaction_workers.discard(worker)
 
 
 def atomic(using=None, savepoint=True, durable=False):

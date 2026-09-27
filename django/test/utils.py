@@ -23,6 +23,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.core.signals import request_started, setting_changed
 from django.db import DEFAULT_DB_ALIAS, connections, reset_queries
 from django.db.models.options import Options
+from django.db.transaction import _transaction_workers
 from django.template import PartialTemplate, Template
 from django.test.signals import template_rendered
 from django.urls import get_script_prefix, set_script_prefix
@@ -382,6 +383,8 @@ def get_unique_databases_and_mirrors(aliases=None):
 
 def teardown_databases(old_config, verbosity, parallel=0, keepdb=False):
     """Destroy all the non-mirror databases."""
+    # Idle async atomic workers can keep persistent connections open.
+    _transaction_workers.clear()
     for connection, old_name, destroy in old_config:
         if destroy:
             if parallel > 1:

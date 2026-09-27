@@ -1,9 +1,11 @@
 import asyncio
 import threading
+from unittest import mock
 
 from asgiref.sync import sync_to_async
 
 from django.db import connection, connections, transaction
+from django.db.transaction import _transaction_workers
 from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 
 from .models import Reporter
@@ -87,6 +89,13 @@ class AsyncAtomicTests(TransactionTestCase):
         self.assertIs(nested_thread, block_thread)
         self.assertIs(nested_connection, block_connection)
 
+    async def test_worker_reused(self):
+        get = sync_to_async(current_thread_and_connection)
+        async with transaction.atomic():
+            first = await get()
+        async with transaction.atomic():
+            self.assertEqual(await get(), first)
+
     async def test_error_on_enter(self):
         async with transaction.atomic():
             await Reporter.objects.acreate(first_name="Tintin")
@@ -118,12 +127,61 @@ class AsyncAtomicTests(TransactionTestCase):
 class AsyncAtomicIsolationTests(TransactionTestCase):
     available_apps = ["transactions"]
 
+    def setUp(self):
+        # Start without idle workers and close their connections afterward.
+        _transaction_workers.clear()
+        self.addCleanup(_transaction_workers.clear)
+
     async def test_connection_closed_on_exit(self):
-        async with transaction.atomic():
-            await Reporter.objects.acreate(first_name="Tintin")
-            _, block_connection = await sync_to_async(current_thread_and_connection)()
-            self.assertIsNotNone(block_connection.connection)
+        get = sync_to_async(current_thread_and_connection)
+        with mock.patch.dict(connection.settings_dict, CONN_MAX_AGE=0):
+            async with transaction.atomic():
+                await Reporter.objects.acreate(first_name="Tintin")
+                _, block_connection = await get()
+                self.assertIsNotNone(block_connection.connection)
         self.assertIsNone(block_connection.connection)
+
+    async def test_persistent_connection_reused(self):
+        get = sync_to_async(current_thread_and_connection)
+        with mock.patch.dict(connection.settings_dict, CONN_MAX_AGE=None):
+            async with transaction.atomic():
+                block_thread, block_connection = await get()
+                await Reporter.objects.acreate(first_name="Tintin")
+                raw_connection = block_connection.connection
+            async with transaction.atomic():
+                self.assertEqual(await get(), (block_thread, block_connection))
+                await Reporter.objects.acreate(first_name="Haddock")
+                self.assertIs(block_connection.connection, raw_connection)
+        await asyncio.to_thread(_transaction_workers.clear)
+        self.assertIsNone(block_connection.connection)
+
+    async def test_worker_discarded_when_pool_full(self):
+        get = sync_to_async(current_thread_and_connection)
+        with (
+            mock.patch.dict(connection.settings_dict, CONN_MAX_AGE=None),
+            mock.patch.object(_transaction_workers, "max_idle", 0),
+        ):
+            async with transaction.atomic():
+                block_thread, block_connection = await get()
+                await Reporter.objects.acreate(first_name="Tintin")
+        await asyncio.to_thread(block_thread.join, 5)
+        self.assertIs(block_thread.is_alive(), False)
+        self.assertIsNone(block_connection.connection)
+
+    async def test_expired_connection_closed_on_enter(self):
+        get = sync_to_async(current_thread_and_connection)
+        with mock.patch.dict(connection.settings_dict, CONN_MAX_AGE=60):
+            async with transaction.atomic():
+                _, block_connection = await get()
+                await Reporter.objects.acreate(first_name="Tintin")
+                raw_connection = block_connection.connection
+            self.assertIs(block_connection.connection, raw_connection)
+            # The connection expires while the worker is idle.
+            block_connection.close_at = 0
+            async with transaction.atomic():
+                self.assertIs((await get())[1], block_connection)
+                await Reporter.objects.acreate(first_name="Haddock")
+                self.assertIsNot(block_connection.connection, raw_connection)
 
     async def test_rollback_does_not_undo_other_task(self):
         transaction_started = asyncio.Event()
