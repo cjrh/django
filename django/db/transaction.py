@@ -1,6 +1,9 @@
 import warnings
 from contextlib import ContextDecorator, contextmanager
+from contextvars import ContextVar
 from functools import wraps
+
+from asgiref.sync import ThreadSensitiveContext, sync_to_async
 
 from django.db import (
     DEFAULT_DB_ALIAS,
@@ -150,6 +153,11 @@ def on_commit(func, using=None, robust=False):
 #################################
 # Decorators / context managers #
 #################################
+
+# Async atomic blocks entered in the current context, innermost last. Each item
+# is the ThreadSensitiveContext that owns the block's worker thread, or None
+# for a nested block that reuses the worker of an enclosing block.
+_async_atomic_blocks = ContextVar("async_atomic_blocks", default=())
 
 
 class Atomic(ContextDecorator):
@@ -324,6 +332,50 @@ class Atomic(ContextDecorator):
                     connection.connection = None
                 else:
                     connection.in_atomic_block = False
+
+    async def __aenter__(self):
+        blocks = _async_atomic_blocks.get()
+        if blocks or await sync_to_async(self._in_atomic_block)():
+            # Nested block: reuse the current worker thread, and so its
+            # connection. __enter__() creates a savepoint. This also applies
+            # when a sync atomic block is open on the thread that called
+            # async_to_sync(), for example the atomic block of a TestCase.
+            thread_context = None
+        else:
+            # Outermost block: connections are stored per thread, so a new
+            # worker thread gives this transaction its own connection. Other
+            # tasks can't run queries in this transaction while it's open.
+            thread_context = ThreadSensitiveContext(force_new_thread=True)
+            await thread_context.__aenter__()
+        try:
+            await sync_to_async(self.__enter__)()
+        except BaseException:
+            if thread_context is not None:
+                await self._aexit_thread_context(thread_context)
+            raise
+        _async_atomic_blocks.set((*blocks, thread_context))
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        *blocks, thread_context = _async_atomic_blocks.get()
+        _async_atomic_blocks.set(tuple(blocks))
+        try:
+            await sync_to_async(self.__exit__)(exc_type, exc_value, traceback)
+        finally:
+            if thread_context is not None:
+                await self._aexit_thread_context(thread_context)
+
+    def _in_atomic_block(self):
+        return get_connection(self.using).in_atomic_block
+
+    @staticmethod
+    async def _aexit_thread_context(thread_context):
+        try:
+            # The worker thread stops when its context exits. Close the
+            # connections that it opened. This must run on the worker thread.
+            await sync_to_async(connections.close_all)()
+        finally:
+            await thread_context.__aexit__(None, None, None)
 
 
 def atomic(using=None, savepoint=True, durable=False):
